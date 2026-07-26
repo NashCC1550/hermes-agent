@@ -1444,6 +1444,120 @@ def test_create_rejects_no_assignee(worker_env):
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
 
 
+def test_create_routes_assignee_via_profile_router(monkeypatch, worker_env, tmp_path):
+    """A kanban_create call from an orchestrator routes its ``assignee``
+    through ``kanban.profile_router`` when one is configured. A valid
+    fallback in the resolver output replaces the orchestrator-supplied
+    placeholder assignee, and the routing evidence is recorded on the
+    child task.
+    """
+    from pathlib import Path
+
+    from tools import kanban_tools as kt
+
+    router = (
+        Path(os.environ["HERMES_HOME"])
+        / "scripts"
+        / "profile_ops"
+        / "route_profiles.py"
+    )
+    router.parent.mkdir(parents=True, exist_ok=True)
+    router.write_text(
+        "import json\n"
+        "print(json.dumps({"
+        "'target': 'retired-profile', "
+        "'dispatch': 'kanban', "
+        "'fallback': ['retired-profile', 'peer', 'default'], "
+        "'rule_keywords': ['remediation']}))\n",
+        encoding="utf-8",
+    )
+    peer_profile = Path(os.environ["HERMES_HOME"]) / "profiles" / "peer"
+    peer_profile.mkdir(parents=True)
+    (peer_profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_PROFILE", "director-sol")
+
+    from hermes_cli import config
+    cfg_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    cfg_path.write_text(
+        "kanban:\n"
+        "  profile_router:\n"
+        "    enabled: true\n"
+        f"    script: '{router}'\n"
+        "    timeout_seconds: 5\n",
+        encoding="utf-8",
+    )
+    config.save_config(config.load_config())
+
+    out = kt._handle_create({
+        "title": "remediation delta",
+        "assignee": "default",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    new_tid = d["task_id"]
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, new_tid)
+        events = kb.list_events(conn, new_tid)
+    finally:
+        conn.close()
+    assert child is not None
+    assert child.assignee == "peer"
+    routed = next(event for event in events if event.kind == "routed")
+    assert routed.payload.get("source") == "profile_router"
+    assert routed.payload.get("target") == "retired-profile"
+    assert "peer" in routed.payload.get("fallback", [])
+
+
+def test_create_preserves_explicit_specialist_assignee(
+    monkeypatch, worker_env, tmp_path,
+):
+    """A trusted explicit assignee must bypass semantic auto-routing."""
+    from pathlib import Path
+
+    from tools import kanban_tools as kt
+
+    router = tmp_path / "route_profiles.py"
+    router.write_text(
+        "import json\n"
+        "print(json.dumps({"
+        "'target': 'default', "
+        "'fallback': ['default'], "
+        "'rule_keywords': ['remediation']}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "director-sol")
+    from hermes_cli import config
+    cfg_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    cfg_path.write_text(
+        "kanban:\n"
+        "  profile_router:\n"
+        "    enabled: true\n"
+        f"    script: '{router}'\n",
+        encoding="utf-8",
+    )
+    config.save_config(config.load_config())
+
+    result = json.loads(kt._handle_create({
+        "title": "remediation delta",
+        "assignee": "peer",
+        "parents": [worker_env],
+    }))
+
+    assert result.get("ok") is True, result
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        child = kb.get_task(conn, result["task_id"])
+        events = kb.list_events(conn, result["task_id"])
+    assert child is not None
+    assert child.assignee == "peer"
+    assert all(event.kind != "routed" for event in events)
+
+
 def test_create_rejects_non_list_parents(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})

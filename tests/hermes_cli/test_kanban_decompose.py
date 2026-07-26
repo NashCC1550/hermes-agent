@@ -75,6 +75,16 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _write_profile_router(home: Path, result: dict) -> Path:
+    script = home / "scripts" / "profile_ops" / "route_profiles.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        "print(" + repr(jsonlib.dumps(result)) + ")\n",
+        encoding="utf-8",
+    )
+    return script
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -111,6 +121,111 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+
+
+def test_decompose_routes_children_after_llm_and_records_evidence(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a small POC", triage=True)
+
+    _write_profile_router(kanban_home, {
+        "target": "build-coder-m3",
+        "dispatch": "delegate",
+        "fallback": ["build-coder-m3", "default"],
+        "rule_keywords": ["POC", "单文件"],
+        "complexity": "low",
+    })
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {
+                "title": "build the POC",
+                "body": "single-file implementation",
+                "assignee": "researcher",
+                "parents": [],
+            },
+        ],
+    })
+    config = {
+        "kanban": {
+            "orchestrator_profile": "orchestrator",
+            "default_assignee": "fallback",
+            "profile_router": {
+                "enabled": True,
+                "script": "scripts/profile_ops/route_profiles.py",
+                "timeout_seconds": 2,
+            },
+        },
+    }
+
+    patches = _patch_list_profiles([
+        "orchestrator", "fallback", "researcher", "build-coder-m3",
+    ])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value=config,
+        ):
+            outcome = decomp.decompose_task(tid, author="director-sol")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+        events = kb.list_events(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.assignee == "build-coder-m3"
+    created = next(event for event in events if event.kind == "created")
+    assert created.payload["routing"] == {
+        "source": "profile_router",
+        "llm_assignee": "researcher",
+        "resolved_assignee": "build-coder-m3",
+        "target": "build-coder-m3",
+        "dispatch": "delegate",
+        "fallback": ["build-coder-m3", "default"],
+        "rule_keywords": ["POC", "单文件"],
+        "complexity": "low",
+    }
+
+
+def test_route_child_assignee_uses_first_valid_fallback(kanban_home) -> None:
+    router = kanban_home / "scripts" / "route_profiles.py"
+    router.parent.mkdir(parents=True)
+    router.write_text(
+        "import json\n"
+        "print(json.dumps({"
+        "'target': 'retired-profile', "
+        "'dispatch': 'kanban', "
+        "'fallback': ['retired-profile', 'build-coder-m3', 'default'], "
+        "'rule_keywords': ['POC']}))\n",
+        encoding="utf-8",
+    )
+
+    assignee, evidence = decomp._route_child_assignee(
+        cfg={
+            "kanban": {
+                "profile_router": {
+                    "enabled": True,
+                    "script": str(router),
+                    "timeout_seconds": 5,
+                }
+            }
+        },
+        title="快速 POC 单文件",
+        body="实现最小可运行原型",
+        llm_assignee="default",
+        valid_names={"build-coder-m3", "default"},
+    )
+
+    assert assignee == "build-coder-m3"
+    assert evidence["source"] == "profile_router"
+    assert evidence["target"] == "retired-profile"
+    assert evidence["fallback"] == ["retired-profile", "build-coder-m3", "default"]
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
