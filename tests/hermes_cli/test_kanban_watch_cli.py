@@ -199,7 +199,7 @@ def test_watch_missing_task_is_rejected(kanban_home, capsys) -> None:
     assert "no such task" in capsys.readouterr().err
 
 
-def test_watch_is_denied_in_delegated_child_context(
+def test_watch_is_allowed_in_delegated_child_context(
     kanban_home, capsys, monkeypatch
 ) -> None:
     with kb.connect_closing() as conn:
@@ -222,11 +222,50 @@ def test_watch_is_denied_in_delegated_child_context(
         ]
     )
 
-    # Delegated-child contexts cannot use ANY Kanban CLI verb, including
-    # read-only watch. The CLI must deny before init_db runs, otherwise the
-    # in-flight backfill would raise PermissionError from inside init_db.
-    assert rc == 1
-    assert "delegate_task" in capsys.readouterr().err
+    # Policy §3.1: delegated children MAY use read-only K0 verbs (watch is one
+    # of them). The verb is served over a genuine mode=ro connection, bypassing
+    # init_db entirely so the in-flight backfill's write_txn never runs.
+    assert rc == 124
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_delegated_child_k0_list_is_allowed(
+    kanban_home, capsys, monkeypatch
+) -> None:
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="visible to child", initial_status="running")
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    rc = _run(["list"])
+
+    assert rc == 0
+    assert "visible to child" in capsys.readouterr().out
+
+
+def test_delegated_child_k0_show_is_allowed(
+    kanban_home, capsys, monkeypatch
+) -> None:
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="readable task",
+            initial_status="running",
+        )
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    rc = _run(["show", task_id])
+
+    assert rc == 0
+    assert "readable task" in capsys.readouterr().out
+
+
+def test_delegated_child_k0_connection_is_genuinely_readonly(kanban_home) -> None:
+    conn = kc._k0_readonly_connect()
+    try:
+        with pytest.raises(Exception):
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('t_x', 'nope')")
+    finally:
+        conn.close()
 
 
 def test_delegated_child_cannot_complete_a_task(
