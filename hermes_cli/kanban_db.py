@@ -175,7 +175,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     it through.
     """
     try:
-        from hermes_cli.lifecycle import invoke_hook
+        from hermes_cli.plugins import invoke_hook
         from hermes_cli.profiles import get_active_profile_name
         try:
             profile_name = get_active_profile_name()
@@ -6067,10 +6067,14 @@ def decompose_triage_task(
                     (author or "decomposer"),
                 ),
             )
-            _append_event(
-                conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
-            )
+            created_payload = {
+                "by": author or "decomposer",
+                "from_decompose_of": task_id,
+            }
+            routing = child.get("routing")
+            if isinstance(routing, dict):
+                created_payload["routing"] = routing
+            _append_event(conn, new_id, "created", created_payload)
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
 
