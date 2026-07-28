@@ -755,6 +755,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                               "(e.g. 'completed,blocked,gave_up,crashed,timed_out')")
     p_watch.add_argument("--interval", type=float, default=0.5,
                          help="Poll interval in seconds (default: 0.5)")
+    p_watch.add_argument("--task", dest="task_id", default=None,
+                         help="Only show events for this task id")
+    p_watch.add_argument(
+        "--until-status",
+        default=None,
+        help="With --task, exit successfully when the task reaches any "
+             "comma-separated status",
+    )
+    p_watch.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Stop waiting after this many seconds",
+    )
 
     # --- stats ---
     p_stats = sub.add_parser(
@@ -987,11 +1001,31 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Board-management commands operate on board metadata and the persisted
-    # current-board pointer itself. They must ignore the shared `--board`
-    # task-routing override; otherwise `/kanban --board beta boards show`
-    # reports beta as the current board even when the on-disk pointer is
-    # alpha.
+    # Delegated-child contexts are a strict trust boundary: every CLI verb is
+    # off-limits to them, even read-only `watch`/`show`/`list`. The check above
+    # covers user-visible mutators; this one blocks the init_db() path that the
+    # in-flight backfill uses to run a write_txn. The check runs BEFORE init so
+    # delegated children get a clean denial rather than a misleading
+    # "could not initialize database" error from the in-flight backfill.
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    if delegated:
+        print(
+            "kanban: delegate_task child contexts cannot use the Kanban CLI",
+            file=sys.stderr,
+        )
+        return 1
+
+    # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
+    # init_db() itself raises KanbanDbCorruptError, which would turn
+    # every `hermes kanban repair` into "could not initialize database"
+    # without ever reaching the repair path. The check above also has to run
+    # before the auto-init so delegated-child contexts see a clean CLI-level
+    # denial for mutation verbs instead of a misleading "could not
+    # initialize database" error.
     if action == "boards":
         return _dispatch_boards(args)
 
@@ -2688,6 +2722,36 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         {k.strip() for k in args.kinds.split(",") if k.strip()}
         if args.kinds else None
     )
+    task_id = getattr(args, "task_id", None)
+    until_statuses = (
+        {s.strip() for s in args.until_status.split(",") if s.strip()}
+        if getattr(args, "until_status", None) else None
+    )
+    if until_statuses and not task_id:
+        print("kanban watch: --until-status requires --task", file=sys.stderr)
+        return 2
+    invalid_statuses = (until_statuses or set()) - kb.VALID_STATUSES
+    if invalid_statuses:
+        print(
+            "kanban watch: unknown status(es): "
+            + ", ".join(sorted(invalid_statuses)),
+            file=sys.stderr,
+        )
+        return 2
+    if task_id:
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"kanban watch: no such task: {task_id}", file=sys.stderr)
+            return 1
+        if until_statuses and task.status in until_statuses:
+            print(f"{task_id} reached status {task.status}")
+            return 0
+    timeout = getattr(args, "timeout", None)
+    if timeout is not None and timeout < 0:
+        print("kanban watch: --timeout must be >= 0", file=sys.stderr)
+        return 2
+    deadline = time.monotonic() + timeout if timeout is not None else None
     cursor = 0
     print("Watching kanban events. Ctrl-C to stop.", flush=True)
     # Seed cursor at the latest id so we don't replay history.
@@ -2709,6 +2773,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                 ).fetchall()
             for r in rows:
                 cursor = max(cursor, int(r["id"]))
+                if task_id and r["task_id"] != task_id:
+                    continue
                 if kinds and r["kind"] not in kinds:
                     continue
                 if args.assignee and r["assignee"] != args.assignee:
@@ -2725,7 +2791,24 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                     f"{r['kind']:18s} (@{r['assignee'] or '-'}){pl}",
                     flush=True,
                 )
-            time.sleep(max(0.1, args.interval))
+            if task_id and until_statuses:
+                with kb.connect_closing() as conn:
+                    task = kb.get_task(conn, task_id)
+                if task is None:
+                    print(f"kanban watch: task disappeared: {task_id}", file=sys.stderr)
+                    return 1
+                if task.status in until_statuses:
+                    print(f"{task_id} reached status {task.status}")
+                    return 0
+            sleep_for = max(0.1, args.interval)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    target = task_id or "kanban events"
+                    print(f"kanban watch: timed out waiting for {target}", file=sys.stderr)
+                    return 124
+                sleep_for = min(sleep_for, remaining)
+            time.sleep(sleep_for)
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
