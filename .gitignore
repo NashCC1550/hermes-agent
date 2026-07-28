@@ -190,3 +190,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# spike backup · archived 2026-07-28
+reference_patches/
+.archive/
