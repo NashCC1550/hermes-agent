@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -59,6 +60,113 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _looks_like_env_key(key: str) -> bool:
+    """Heuristic matching Hermes CLI's config-set env routing."""
+    normalized = (key or "").strip().upper()
+    api_keys = {
+        'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
+        'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
+        'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
+        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
+        'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
+        'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
+        'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
+        'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
+        'GITHUB_TOKEN', 'HONCHO_API_KEY',
+    }
+    return (
+        normalized in api_keys
+        or normalized.endswith(("_API_KEY", "_TOKEN"))
+        or normalized.startswith("TERMINAL_SSH")
+    )
+
+
+def _get_nested_value(data, dotted_key: str):
+    """Traverse dict/list using dotted keys with optional numeric indices."""
+    current = data
+    for part in dotted_key.split('.'):
+        if isinstance(current, list):
+            try:
+                idx = int(part)
+            except ValueError as exc:
+                raise KeyError(f"Expected list index at '{part}'") from exc
+            if idx < 0 or idx >= len(current):
+                raise KeyError(f"List index out of range: {idx}")
+            current = current[idx]
+        elif isinstance(current, dict):
+            if part not in current:
+                raise KeyError(f"Missing key: {part}")
+            current = current[part]
+        else:
+            raise KeyError(f"Cannot descend into non-container at '{part}'")
+    return current
+
+
+def _delete_nested_value(data, dotted_key: str) -> bool:
+    """Delete a nested dict/list key. Returns True if deleted."""
+    parts = dotted_key.split('.')
+    current = data
+    for part in parts[:-1]:
+        if isinstance(current, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return False
+            if idx < 0 or idx >= len(current):
+                return False
+            current = current[idx]
+        elif isinstance(current, dict):
+            if part not in current:
+                return False
+            current = current[part]
+        else:
+            return False
+
+    last = parts[-1]
+    if isinstance(current, list):
+        try:
+            idx = int(last)
+        except ValueError:
+            return False
+        if idx < 0 or idx >= len(current):
+            return False
+        del current[idx]
+        return True
+    if isinstance(current, dict) and last in current:
+        del current[last]
+        return True
+    return False
+
+
+def _write_raw_user_config(config_data: dict) -> None:
+    from hermes_cli.config import ensure_hermes_home, get_config_path
+    from utils import atomic_yaml_write
+
+    ensure_hermes_home()
+    config_path = get_config_path()
+    atomic_yaml_write(config_path, config_data, sort_keys=False)
+
+
+def _run_hermes_command(args: List[str]) -> dict:
+    """Run Hermes CLI command and capture stdout/stderr for MCP callers."""
+    result = subprocess.run(
+        ["hermes", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        shell=False,
+    )
+    return {
+        "command": ["hermes", *args],
+        "exit_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.returncode == 0,
+    }
+
 
 def _get_sessions_dir() -> Path:
     """Return the sessions directory using HERMES_HOME."""
@@ -995,6 +1103,229 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
+
+    # -- hermes_config_paths -----------------------------------------------
+
+    @mcp.tool()
+    def hermes_config_paths() -> str:
+        """Return Hermes config.yaml and .env paths for this installation."""
+        from hermes_cli.config import get_config_path, get_env_path
+
+        return json.dumps({
+            "config_path": str(get_config_path()),
+            "env_path": str(get_env_path()),
+        }, indent=2)
+
+    # -- hermes_config_show -------------------------------------------------
+
+    @mcp.tool()
+    def hermes_config_show(include_env: bool = False) -> str:
+        """Return the full expanded Hermes configuration and optionally .env values.
+
+        WARNING: include_env=true exposes secrets stored in ~/.hermes/.env.
+        """
+        from hermes_cli.config import load_config, load_env, get_config_path, get_env_path
+
+        payload = {
+            "config_path": str(get_config_path()),
+            "env_path": str(get_env_path()),
+            "config": load_config(),
+        }
+        if include_env:
+            payload["env"] = load_env()
+        return json.dumps(payload, indent=2)
+
+    # -- hermes_config_get --------------------------------------------------
+
+    @mcp.tool()
+    def hermes_config_get(key: str, include_env: bool = True) -> str:
+        """Get one Hermes config or env value by key.
+
+        Examples:
+            key="model.default"
+            key="dashboard.theme"
+            key="OPENROUTER_API_KEY"
+        """
+        from hermes_cli.config import load_config, load_env
+
+        if not key:
+            return json.dumps({"error": "key is required"})
+
+        normalized = key.strip()
+        if include_env:
+            env_vars = load_env()
+            if normalized in env_vars:
+                return json.dumps({
+                    "key": normalized,
+                    "source": "env",
+                    "value": env_vars.get(normalized),
+                }, indent=2)
+
+        try:
+            value = _get_nested_value(load_config(), normalized)
+        except KeyError as e:
+            return json.dumps({"error": f"Key not found: {normalized}", "details": str(e)})
+
+        return json.dumps({
+            "key": normalized,
+            "source": "config",
+            "value": value,
+        }, indent=2)
+
+    # -- hermes_config_set --------------------------------------------------
+
+    @mcp.tool()
+    def hermes_config_set(key: str, value: str) -> str:
+        """Set one Hermes config or env value.
+
+        Routes secrets like *_API_KEY / *_TOKEN into ~/.hermes/.env using the
+        same logic as `hermes config set`.
+        """
+        from hermes_cli.config import get_config_path, get_env_path, set_config_value
+
+        if not key:
+            return json.dumps({"error": "key is required"})
+
+        try:
+            set_config_value(key, value)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to set {key}: {e}"})
+
+        return json.dumps({
+            "success": True,
+            "key": key,
+            "value": value,
+            "target_file": str(get_env_path() if _looks_like_env_key(key) else get_config_path()),
+            "restart_hint": "Some Hermes settings take effect only in new sessions or after restarting dashboard/gateway.",
+        }, indent=2)
+
+    # -- hermes_config_delete -----------------------------------------------
+
+    @mcp.tool()
+    def hermes_config_delete(key: str) -> str:
+        """Delete one Hermes config or env value from the persisted store."""
+        from hermes_cli.config import (
+            get_config_path,
+            get_env_path,
+            remove_env_value,
+        )
+        import yaml
+
+        if not key:
+            return json.dumps({"error": "key is required"})
+
+        normalized = key.strip()
+
+        if _looks_like_env_key(normalized):
+            try:
+                removed = remove_env_value(normalized)
+            except Exception as e:
+                return json.dumps({"error": f"Failed to remove env key {normalized}: {e}"})
+            return json.dumps({
+                "success": removed,
+                "key": normalized,
+                "source": "env",
+                "target_file": str(get_env_path()),
+                "message": "Removed" if removed else "Key not present",
+            }, indent=2)
+
+        config_path = get_config_path()
+        raw = {}
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    raw = yaml.safe_load(f) or {}
+            except Exception as e:
+                return json.dumps({"error": f"Failed to load config file: {e}"})
+
+        removed = _delete_nested_value(raw, normalized)
+        if not removed:
+            return json.dumps({
+                "success": False,
+                "key": normalized,
+                "source": "config",
+                "target_file": str(config_path),
+                "message": "Key not present in raw user config",
+            }, indent=2)
+
+        try:
+            _write_raw_user_config(raw)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to write config file: {e}"})
+
+        return json.dumps({
+            "success": True,
+            "key": normalized,
+            "source": "config",
+            "target_file": str(config_path),
+            "restart_hint": "Some Hermes settings take effect only in new sessions or after restarting dashboard/gateway.",
+        }, indent=2)
+
+    # -- hermes_env_set -----------------------------------------------------
+
+    @mcp.tool()
+    def hermes_env_set(key: str, value: str) -> str:
+        """Force-set any variable in ~/.hermes/.env exactly as provided."""
+        from hermes_cli.config import get_env_path, save_env_value
+
+        if not key:
+            return json.dumps({"error": "key is required"})
+        try:
+            save_env_value(key.strip().upper(), value)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to set env key {key}: {e}"})
+        return json.dumps({
+            "success": True,
+            "key": key.strip().upper(),
+            "value": "***",
+            "target_file": str(get_env_path()),
+        }, indent=2)
+
+    # -- hermes_service_command ---------------------------------------------
+
+    @mcp.tool()
+    def hermes_service_command(target: str, args: List[str]) -> str:
+        """Run a management command against Hermes dashboard or gateway.
+
+        Examples:
+            target="dashboard", args=["--status"]
+            target="dashboard", args=["--stop"]
+            target="gateway", args=["restart"]
+        """
+        if target not in {"dashboard", "gateway"}:
+            return json.dumps({"error": "target must be 'dashboard' or 'gateway'"})
+        if not isinstance(args, list):
+            return json.dumps({"error": "args must be a list"})
+
+        try:
+            return json.dumps(_run_hermes_command([target, *args]), indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to run Hermes {target} command: {e}"})
+
+    # -- hermes_cli_command -------------------------------------------------
+
+    @mcp.tool()
+    def hermes_cli_command(args: List[str]) -> str:
+        """Run a Hermes CLI command and return stdout/stderr.
+
+        Example:
+            args=["config", "check"]
+            args=["dashboard", "--status"]
+            args=["gateway", "restart"]
+        """
+        if not isinstance(args, list) or not args:
+            return json.dumps({"error": "args must be a non-empty list of CLI arguments"})
+
+        blocked = {"chat", "acp", "mcp", "gateway", "dashboard", "update", "uninstall"}
+        if args[0] in blocked:
+            return json.dumps({
+                "error": f"Subcommand '{args[0]}' is blocked in hermes_cli_command. Use dedicated MCP tools or add an explicit management tool if needed."
+            })
+
+        try:
+            return json.dumps(_run_hermes_command(args), indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to run Hermes CLI command: {e}"})
 
     return mcp
 
