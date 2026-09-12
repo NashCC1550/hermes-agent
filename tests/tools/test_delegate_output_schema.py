@@ -24,6 +24,7 @@ from tools.delegate_tool import (
 from tools.delegation_output_schema import (
     append_output_contract,
     build_retry_message,
+    coerce_output_schema,
     validate_output,
 )
 
@@ -426,18 +427,18 @@ class TestRunSingleChildSchemaValidation:
         assert "answer_was_wrapped" not in entry
         assert len(child.calls) == 1
 
-    def test_constraining_schema_with_prose_still_failed(self):
-        """Regression: strict-schema + prose answer keeps the v0.21.2 contract
-        of status="failed" with a schema violation error message. The lenient
-        path must NOT swallow strict-schema failures (otherwise orchestrators
-        would silently accept empty verdicts)."""
+    def test_constraining_schema_with_prose_preserves_raw_text(self):
+        """Regression: strict-schema + prose after the bounded retry does NOT
+        flip status to failed — upstream 45ab3ad5 keeps the child's raw text
+        as ``summary`` with status "completed", ``schema_valid: false`` and a
+        ``schema_note``. The lenient wrap path must not fire here either."""
         child = _StubChild(["not json", "still not json"])
         child._delegate_output_schema = ADDRESS_SCHEMA
         entry = _run(child)
-        assert entry["status"] == "failed"
+        assert entry["status"] == "completed"
         assert entry["schema_valid"] is False
         assert entry["schema_errors"]
-        assert "output_schema" in entry.get("error", "")
+        assert "UNVALIDATED" in entry["schema_note"]
         assert entry["summary"] == "still not json"
         assert "schema_warnings" not in entry
         assert "answer_was_wrapped" not in entry
@@ -544,3 +545,102 @@ class TestDelegateTaskDispatch:
         assert "OUTPUT CONTRACT" in (captured.get("context") or "")
         results = payload.get("results") or []
         assert results and results[0].get("schema_valid") is True
+
+
+# ---------------------------------------------------------------------------
+# _build_result_entry: schema-wrapped prose must NOT be eaten by an upstream
+# child-loop failure flag. Regression for "活干了但汇报被吞" #2 — when the
+# child produced a real prose answer that the forgiving-schema validator
+# already wrapped, the validator's acceptance wins over a downstream
+# `result["failed"]=True` (e.g. provider rate-limit fired mid-turn, transport
+# glitch on the last write). status must be `completed_with_warnings`, not
+# `failed`.
+# ---------------------------------------------------------------------------
+
+
+class _FailingButProseChild(_StubChild):
+    """Child whose run_conversation returns the prose answer AND marks the
+    result as failed (mimics a provider error racing the child's last turn).
+    """
+
+    def __init__(self, prose, *, error="provider rate_limit", reason="rate_limit"):
+        super().__init__([prose])
+        self._prose = prose
+        self._error = error
+        self._reason = reason
+
+    def run_conversation(self, user_message=None, task_id=None, **_kwargs):
+        self.calls.append(user_message)
+        return {
+            "final_response": self._prose,
+            "completed": True,
+            "failed": True,
+            "error": self._error,
+            "failure_reason": self._reason,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+
+class TestWrappedProseSurvivesUpstreamFailure:
+    """v0.21.3+followup: the `completed_with_warnings` branch in
+    _build_result_entry must take precedence over `result["failed"]=True` —
+    without this, the very rate-limit case the original bug fix was meant to
+    handle still loses the answer when the failure flag races the response.
+    """
+
+    PROSE = (
+        "## 任务完成\n\n"
+        "- 找到 3 个相关 issue\n"
+        "- 复现步骤见 step 2\n\n"
+        "**结论**: 需要在 xcode 中升级 SDK 版本"
+    )
+
+    def test_forgiving_schema_prose_with_failed_flag_is_completed_with_warnings(self):
+        """Empty schema + prose answer + result['failed']=True:
+        validator wraps the prose (answer_was_wrapped=True), so status must
+        be `completed_with_warnings` and the summary must survive verbatim."""
+        child = _FailingButProseChild(self.PROSE)
+        child._delegate_output_schema = {}
+        entry = _run(child)
+        assert entry["status"] == "completed_with_warnings", (
+            f"wrapped prose must not be eaten by upstream failed flag; got {entry['status']!r} "
+            f"with error={entry.get('error')!r}"
+        )
+        # the prose is preserved — no truncation, no "(empty)" sentinel
+        assert entry["summary"] == self.PROSE
+        # validator did its job; upstream error is a separate signal, not the verdict
+        assert entry.get("schema_valid") is True
+        assert entry.get("answer_was_wrapped") is True
+        # the structured upstream failure is still surfaced for observability
+        # (caller may render a ⚠ icon or page the operator), but it MUST NOT
+        # override status when the work has been wrapped into the contract.
+        assert entry.get("failure_reason") == "rate_limit"
+        # no retry was warranted — the first prose was already accepted
+        assert entry.get("schema_retries", 0) == 0
+        # the literal error string from the strict-schema branch must NOT fire
+        assert "Final answer does not satisfy the declared output_schema" not in (
+            entry.get("error") or ""
+        )
+
+    def test_constraining_schema_still_fails_with_failed_flag(self):
+        """Belt: a constraining schema + non-JSON answer + result['failed']=True
+        must still report `failed` (we only promote wrapped-prose; the strict
+        path is untouched)."""
+        child = _FailingButProseChild("not json at all")
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        entry = _run(child)
+        assert entry["status"] == "failed"
+        # The upstream error text wins because the schema is strict (no wrap
+        # promotion fired), and it is the verdict — not a side signal.
+        assert "provider rate_limit" in (entry.get("error") or "")
+
+    def test_forgiving_schema_prose_without_failed_flag(self):
+        """Sanity: the original completed_with_warnings path still works
+        when there is no upstream failure flag."""
+        child = _StubChild([self.PROSE])
+        child._delegate_output_schema = {}
+        entry = _run(child)
+        assert entry["status"] == "completed_with_warnings"
+        assert entry["summary"] == self.PROSE
+        assert "failure_reason" not in entry

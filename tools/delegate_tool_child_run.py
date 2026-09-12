@@ -596,6 +596,18 @@ def _build_result_entry(
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
+    # Branch order matters (every branch is exclusive):
+    #   1. Explicit cooperative interrupt — a deliberate user signal that wins
+    #      over every other heuristic, including the schema-wrap promotion.
+    #   2. Forgiving-schema + prose answer — the validator already accepted the
+    #      work via wrap, so a downstream `result["failed"]=True` (provider
+    #      rate-limit, transport glitch racing the last turn) MUST NOT flip
+    #      status to "failed" and hide the real work in `summary`. This is
+    #      the v0.21.3 "活干了但汇报被吞" fix in its strict form.
+    #   3. Genuine child-loop failure (no usable summary / structured error
+    #      not explained by #2) — status="failed", exit_reason="error".
+    #   4. Schema-valid answer, no schema, or schema-violating raw text → the
+    #      child-loop contract branch (status from usable_summary).
     interrupt_note = ""
     if result.get("interrupted", False):
         status, exit_reason = "interrupted", "interrupted"
@@ -612,8 +624,7 @@ def _build_result_entry(
         # Forgiving-schema prose: the work is done, the validator wrapped the answer to honor the contract,
         # and the summary is preserved. A downstream `result["failed"]=True` (provider rate-limit, transport
         # glitch racing the last turn) MUST NOT flip status to "failed" and hide the real work in `summary` —
-        # the upstream error is surfaced as a non-verdict `_upstream_error` field below (the strict form of
-        # the v0.21.3 "活干了但汇报被吞" fix).
+        # the upstream error is surfaced as a non-verdict `_upstream_error` field below.
         status, exit_reason = "completed_with_warnings", "completed"
     elif result.get("failed") or result.get("error"):
         # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
@@ -627,14 +638,10 @@ def _build_result_entry(
         # contract verdict, and the summary is prefixed with a notice so a status-only reader cannot mistake it
         # for validated output.
         #
-        # Branch order matters (every branch above is exclusive):
-        #   1. Explicit cooperative interrupt — wins over every heuristic, including the schema-wrap promotion.
-        #   2. Forgiving-schema + prose answer (handled ABOVE) — the validator already accepted the work via
-        #      wrap, so a downstream `result["failed"]=True` (provider rate-limit, transport glitch racing the
-        #      last turn) MUST NOT flip status to "failed" and hide the real work in `summary`.
-        #   3. Constraining-schema violation after bounded retry — handled BELOW via schema_note, status stays
-        #      "completed" with schema_valid=false (upstream 45ab3ad5 semantics).
-        #   * ``completed``              — schema-valid, no schema, or schema-violating raw text preserved.
+        # Branch contract (wrap promotion resolved ABOVE, so an upstream child-loop failed/error flag
+        # cannot override it):
+        #   * ``completed``              — schema-valid, no schema requested, or schema-violating raw text
+        #                                  preserved via schema_note (upstream 45ab3ad5 semantics).
         #   * ``completed_with_warnings``— forgiving schema + prose answer that the validator wrapped.
         #   * ``failed``                 — child genuinely failed (no summary / structured error).
         #   * ``interrupted``            — cooperative interrupt.
